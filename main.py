@@ -1,11 +1,13 @@
 """Windows용 원형 집중 타이머. 표준 라이브러리만 사용한다."""
 
 import math
+import os
+import sys
 import threading
 import time
 import tkinter as tk
 import winsound
-from ctypes import windll
+from ctypes import byref, c_void_p, windll
 
 # 창 밖은 이 색으로 뚫어서 투명하게 만든다.
 TRANS = "#010102"
@@ -28,6 +30,49 @@ def enable_sharp_text():
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+
+
+def enable_taskbar_identity():
+    """작업 표시줄이 이 프로그램을 파이썬이 아닌 타이머로 보게 한다."""
+    try:
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("FocusTimer.Widget")
+    except Exception:
+        pass
+
+
+def window_hwnd(root):
+    root.update_idletasks()
+    return windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+
+
+def show_on_taskbar(root):
+    """테두리를 없앤 창도 작업 표시줄 버튼이 나오게 한다."""
+    hwnd = window_hwnd(root)
+    style = windll.user32.GetWindowLongW(hwnd, -20)
+    style = (style & ~0x00000080) | 0x00040000
+    windll.user32.SetWindowLongW(hwnd, -20, style)
+    windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+    return hwnd
+
+
+def apply_window_icon(root):
+    """작업 표시줄과 창이 위젯 아이콘을 쓰게 한다."""
+    hwnd = window_hwnd(root)
+    if getattr(sys, "frozen", False):
+        large = c_void_p()
+        small = c_void_p()
+        windll.shell32.ExtractIconExW(sys.executable, 0, byref(large), byref(small), 1)
+        if large.value:
+            windll.user32.SendMessageW(hwnd, 0x0080, 1, large)
+        if small.value:
+            windll.user32.SendMessageW(hwnd, 0x0080, 0, small)
+        return
+    icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+    if os.path.exists(icon):
+        try:
+            root.iconbitmap(default=icon)
+        except tk.TclError:
+            pass
 
 
 def play_chime():
@@ -71,13 +116,15 @@ class FocusTimer:
         self.running = False
         self.finished = False
         self.topmost = True
-        self.bg_mode = "clear"
+        self.bg_mode = "solid"
         self.after_id = None
         self.flash_after_id = None
         self.flash_on = False
         self.deadline = 0.0
         self._press = None
         self._moved = False
+        self._held = False
+        self._hold_after = None
         self._zone = "center"
         self._build()
         self.draw()
@@ -113,24 +160,28 @@ class FocusTimer:
         self.menu.add_command(label="배경 투명", command=self.toggle_clear)
         self.menu.add_command(label="배경 반투명", command=self.toggle_dim)
         self.menu.add_separator()
-        self._refresh_menu()
         self.menu.add_command(label="시작 / 일시정지", command=self.toggle_run)
         self.menu.add_command(label="초기화", command=self.reset)
         self.menu.add_separator()
         self.menu.add_command(label="종료", command=self.root.destroy)
+        self._refresh_menu()
 
     def on_press(self, event):
         self._press = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
         self._moved = False
+        self._held = False
         distance = math.hypot(event.x - self.cx, event.y - self.cy)
         # 숫자 쪽은 창 이동, 그 바깥 원형 눈금은 시간 조절이다.
         self._zone = "center" if distance < self.radius * 0.46 else "dial"
+        self._cancel_hold()
+        self._hold_after = self.root.after(500, self._on_hold)
 
     def on_drag(self, event):
-        if self._press is None:
+        if self._press is None or self._held:
             return
         if abs(event.x_root - self._press[0]) + abs(event.y_root - self._press[1]) > 4:
             self._moved = True
+            self._cancel_hold()
         if not self._moved:
             return
         if self._zone == "dial":
@@ -141,13 +192,31 @@ class FocusTimer:
         self.root.geometry(f"+{self._press[2] + dx}+{self._press[3] + dy}")
 
     def on_release(self, event):
+        self._cancel_hold()
+        if self._held:
+            self._press = None
+            return
         if self._zone == "dial":
             self.set_minutes(self.minutes_at(event.x, event.y))
         elif not self._moved:
             self.toggle_run()
         self._press = None
 
+    def _on_hold(self):
+        """위젯을 가만히 누르고 있으면 시작하거나 일시정지한다."""
+        self._hold_after = None
+        if self._press is None or self._moved:
+            return
+        self._held = True
+        self.toggle_run()
+
+    def _cancel_hold(self):
+        if self._hold_after is not None:
+            self.root.after_cancel(self._hold_after)
+            self._hold_after = None
+
     def on_right_click(self, event):
+        self._refresh_menu()
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -173,18 +242,24 @@ class FocusTimer:
             self.deadline = time.monotonic() + self.remaining
         self.draw()
 
-    def _mark(self, name, on):
-        return f"✓  {name}" if on else f"    {name}"
+    def _mark(self, name, on=False):
+        # 체크와 빈칸을 같은 너비로 두어 메뉴 글자 시작 위치를 맞춘다.
+        mark = "✓" if on else "\u3000"
+        return f"{mark}  {name}"
 
     def _refresh_menu(self):
         """체크 글자를 라벨에 넣어서, 마우스를 올리지 않아도 선택된 항목이 보이게 한다."""
         self.menu.entryconfigure(0, label=self._mark("항상 위", self.topmost))
         self.menu.entryconfigure(2, label=self._mark("배경 투명", self.bg_mode == "clear"))
         self.menu.entryconfigure(3, label=self._mark("배경 반투명", self.bg_mode == "dim"))
+        self.menu.entryconfigure(5, label=self._mark("시작 / 일시정지", self.running))
+        self.menu.entryconfigure(6, label=self._mark("초기화"))
+        self.menu.entryconfigure(8, label=self._mark("종료"))
 
     def toggle_topmost(self):
         self.topmost = not self.topmost
         self.root.attributes("-topmost", self.topmost)
+        show_on_taskbar(self.root)
         self._refresh_menu()
 
     def toggle_clear(self):
@@ -201,6 +276,7 @@ class FocusTimer:
         hwnd = windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
         alpha = 145 if self.bg_mode == "dim" else 255
         windll.user32.SetLayeredWindowAttributes(hwnd, 0x00020101, alpha, 0x1 | 0x2)
+        show_on_taskbar(self.root)
         self._refresh_menu()
         self.draw()
 
@@ -219,6 +295,7 @@ class FocusTimer:
             self.finished = False
         self.running = True
         self.deadline = time.monotonic() + self.remaining
+        self._refresh_menu()
         self.draw()
         self.tick()
 
@@ -228,6 +305,7 @@ class FocusTimer:
         self.running = False
         self._cancel_tick()
         self.remaining = max(0.0, self.deadline - time.monotonic())
+        self._refresh_menu()
         self.draw()
 
     def reset(self):
@@ -236,6 +314,7 @@ class FocusTimer:
         self._cancel_tick()
         self._cancel_flash()
         self.remaining = float(self.total)
+        self._refresh_menu()
         self.draw()
 
     def tick(self):
@@ -245,6 +324,7 @@ class FocusTimer:
             self.running = False
             self.finished = True
             self.after_id = None
+            self._refresh_menu()
             play_chime()
             self._start_flash()
             return
@@ -413,6 +493,7 @@ class FocusTimer:
 
 def main():
     enable_sharp_text()
+    enable_taskbar_identity()
     root = tk.Tk()
     root.withdraw()
     root.title("집중 타이머")
@@ -425,8 +506,16 @@ def main():
     y = (root.winfo_screenheight() - height) // 2
     root.geometry(f"{width}x{height}+{x}+{y}")
     timer = FocusTimer(root)
+    show_on_taskbar(root)
+    apply_window_icon(root)
     root.deiconify()
-    root.after(50, timer.apply_background)
+
+    def settle():
+        timer.apply_background()
+        show_on_taskbar(root)
+        apply_window_icon(root)
+
+    root.after(50, settle)
     root.mainloop()
 
 
